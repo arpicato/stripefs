@@ -33,6 +33,7 @@ static dev_t root_devices[MAX_DISKS];
 /* Namespace operations are serialized; open file descriptors can read in parallel. */
 static pthread_rwlock_t namespace_lock = PTHREAD_RWLOCK_INITIALIZER;
 static atomic_int active_handles;
+static bool direct_reads;
 
 struct sf_handle {
     int fd;
@@ -669,7 +670,11 @@ static int ds_open(const char *path, struct fuse_file_info *fi) {
     if (!rc) {
         fi->fh = (uint64_t)(uintptr_t)h;
         atomic_fetch_add(&active_handles, 1);
-        if (kind) fi->keep_cache = 1;
+        if (kind) {
+            /* Keep ext4's cache, not a second copy in FUSE; preserve mmap support. */
+            fi->direct_io = direct_reads;
+            fi->keep_cache = !direct_reads;
+        }
     } else if (h) {
         if (h->fd >= 0) close(h->fd);
         if (h->map_fd >= 0) close(h->map_fd);
@@ -1026,6 +1031,11 @@ static int ds_statfs(const char *path, struct statvfs *out) {
 }
 
 static void *ds_init(struct fuse_conn_info *conn, struct fuse_config *cfg) {
+    /* ponytail: older libfuse/kernels retain cached reads; upgrade for direct mmap. */
+#ifdef FUSE_CAP_DIRECT_IO_ALLOW_MMAP
+    direct_reads = (conn->capable & FUSE_CAP_DIRECT_IO_ALLOW_MMAP) != 0;
+    if (direct_reads) conn->want |= FUSE_CAP_DIRECT_IO_ALLOW_MMAP;
+#endif
     conn->max_background = 64;
     conn->max_readahead = 16U * 1024U * 1024U;
     conn->max_read = 1024U * 1024U;
