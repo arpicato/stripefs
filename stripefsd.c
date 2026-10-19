@@ -13,6 +13,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <sys/uio.h>
 #include <unistd.h>
 #include <sys/xattr.h>
 #include <sys/random.h>
@@ -109,6 +110,30 @@ static int fsync_dir(const char *path) {
     close(fd); return rc;
 }
 
+static int read_backing(int fd, void *buf, size_t size, off_t off, bool uncached) {
+    size_t done = 0;
+    while (done < size) {
+        ssize_t n;
+#ifdef RWF_DONTCACHE
+        if (uncached) {
+            struct iovec v = {.iov_base = (char *)buf + done, .iov_len = size - done};
+            n = preadv2(fd, &v, 1, off + (off_t)done, RWF_DONTCACHE);
+            if (n < 0 && (errno == EOPNOTSUPP || errno == EINVAL || errno == ENOSYS)) {
+                uncached = false;
+                continue;
+            }
+        } else
+#else
+        (void)uncached;
+#endif
+            n = pread(fd, (char *)buf + done, size - done, off + (off_t)done);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return n < 0 ? -errno : -EIO;
+        done += (size_t)n;
+    }
+    return 0;
+}
+
 static int striped_read(int map_fd, const int segment_fds[MAX_DISKS], char *buf,
                         size_t size, off_t off) {
     size_t done = 0;
@@ -125,7 +150,10 @@ static int striped_read(int map_fd, const int segment_fds[MAX_DISKS], char *buf,
             disk_stat.st_dev != root_devices[entry.disk - 1]) return -EIO;
         int fd = segment_fds[entry.disk - 1];
         if (fd < 0) return -EIO;
-        int rc = read_all(fd, buf + done, amount, (off_t)entry.offset + (off_t)chunk_off);
+        /* ponytail: small fault reads use native uncached I/O; large reads keep prefetch.
+         * Unsupported kernels/filesystems fall back to buffered reads. */
+        int rc = read_backing(fd, buf + done, amount,
+                              (off_t)entry.offset + (off_t)chunk_off, size <= 128U * 1024U);
         if (rc) return -EIO;
         done += amount;
     }
@@ -659,7 +687,8 @@ static int ds_open(const char *path, struct fuse_file_info *fi) {
                 char data[PATH_MAX]; internal_path(i, "chunks", id, "data", data);
                 h->segment_fds[i] = open(data, O_RDONLY);
                 if (h->segment_fds[i] < 0) { rc = -EIO; break; }
-                posix_fadvise(h->segment_fds[i], 0, 0, POSIX_FADV_SEQUENTIAL);
+                /* Explicit prefetch owns read-ahead; avoid a second kernel predictor. */
+                posix_fadvise(h->segment_fds[i], 0, 0, POSIX_FADV_RANDOM);
             }
             if (!rc) {
                 h->striped = true;
@@ -722,7 +751,7 @@ static int ds_read(const char *path, char *buf, size_t size, off_t off,
         if (fstat(h->fd, &st)) return -errno;
         if (off >= st.st_size) return 0;
         if (size > (size_t)(st.st_size - off)) size = (size_t)(st.st_size - off);
-        prefetch_stripes(h, size, off);
+        if (size > 128U * 1024U) prefetch_stripes(h, size, off);
         return striped_read(h->map_fd, h->segment_fds, buf, size, off);
     }
     ssize_t n = pread(h->fd, buf, size, off);
