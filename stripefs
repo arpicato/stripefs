@@ -1,0 +1,487 @@
+#!/usr/bin/env python3
+"""StripeFS storage manager. Run `stripefs COMMAND --help` for details."""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+
+
+APP = Path(__file__).resolve().parent
+STATE = Path.home() / ".config" / "stripefs"
+CONFIG = STATE / "config"
+LINKS = STATE / "links.json"
+TRANSACTIONS = STATE / "transactions"
+SERVICE = Path.home() / ".config" / "systemd" / "user" / "stripefs.service"
+RESERVE = 64 * 1024 * 1024
+
+
+def fail(message):
+    raise RuntimeError(message)
+
+
+def fsync_dir(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def atomic_text(path, content):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".stripefs-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, path)
+        fsync_dir(path.parent)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def load_config():
+    if not CONFIG.exists():
+        fail("StripeFS is not initialized; run stripefs init")
+    mount = None
+    disks = []
+    for line in CONFIG.read_text().splitlines():
+        parts = line.split("\t")
+        if parts[0] == "mount" and len(parts) == 2:
+            mount = Path(parts[1])
+        elif parts[0] == "root" and len(parts) == 3:
+            disks.append((Path(parts[2]), int(parts[1])))
+        else:
+            fail("invalid StripeFS configuration")
+    if not mount or len(disks) < 2:
+        fail("incomplete StripeFS configuration")
+    return mount, disks
+
+
+def load_links():
+    return json.loads(LINKS.read_text()) if LINKS.exists() else {}
+
+
+def save_links(links):
+    atomic_text(LINKS, json.dumps(links, indent=2, sort_keys=True) + "\n")
+
+
+def recover_links():
+    TRANSACTIONS.mkdir(parents=True, exist_ok=True)
+    links = load_links()
+    for journal in TRANSACTIONS.glob("*.json"):
+        record = json.loads(journal.read_text())
+        source = Path(record["source"])
+        backup = Path(record["backup"])
+        target = Path(record["target"])
+        temporary = Path(record["temporary"])
+        if source.is_symlink() and source.resolve() == target:
+            links[str(source)] = {"target": str(target), "backup": str(backup)}
+            save_links(links)
+        elif not source.exists() and backup.exists():
+            os.replace(backup, source)
+            fsync_dir(source.parent)
+        elif not source.exists() and not backup.exists():
+            fail(f"cannot recover link transaction {journal}; both paths are missing")
+        if temporary.is_symlink():
+            temporary.unlink()
+        journal.unlink()
+        fsync_dir(journal.parent)
+
+
+def digest(path):
+    h = hashlib.sha256()
+    with path.open("rb", buffering=1024 * 1024) as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            h.update(block)
+    return h.digest()
+
+
+def measure_read_speed(root):
+    fd, name = tempfile.mkstemp(prefix=".stripefs-speed-", dir=root)
+    os.close(fd)
+    try:
+        subprocess.run(["dd", "if=/dev/zero", f"of={name}", "bs=4M", "count=64",
+                        "oflag=direct", "conv=fdatasync", "status=none"], check=True)
+        started = time.perf_counter()
+        result = subprocess.run(["dd", f"if={name}", "of=/dev/null", "bs=4M",
+                                 "iflag=direct", "status=none"], capture_output=True)
+        if result.returncode:
+            # Some ext4/kernel combinations reject direct reads of this file.
+            # Evict the freshly written pages and measure a buffered read.
+            fd = os.open(name, os.O_RDONLY)
+            try:
+                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            finally:
+                os.close(fd)
+            started = time.perf_counter()
+            subprocess.run(["dd", f"if={name}", "of=/dev/null", "bs=4M",
+                            "status=none"], check=True)
+            print(f"Direct reads unavailable on {root}; used cold buffered read")
+        elapsed = time.perf_counter() - started
+        return max(1, min(1000000, round(256 / elapsed)))
+    finally:
+        Path(name).unlink(missing_ok=True)
+
+
+def unit_quote(path):
+    return '"' + str(path).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def cmd_init(args):
+    if not (APP / "stripefsd").exists():
+        subprocess.run(["make", "-C", str(APP), "stripefsd"], check=True)
+    roots = [Path(p).expanduser().resolve() for p in args.disk]
+    if not 2 <= len(roots) <= 16:
+        fail("configure between 2 and 16 disks")
+    if len(set(roots)) != len(roots):
+        fail("duplicate backing path")
+    previous_mount, existing = load_config() if CONFIG.exists() else (None, [])
+    if existing and [p for p, _ in existing] != roots[:len(existing)]:
+        fail("existing disk order cannot change; append new disks after the existing ones")
+    mount = Path(args.mount).expanduser().resolve()
+    if any(root == mount or root in mount.parents or mount in root.parents for root in roots):
+        fail("mountpoint and backing directories must not overlap")
+    for root in roots:
+        root.mkdir(parents=True, exist_ok=True)
+    mount.mkdir(parents=True, exist_ok=True)
+    devices = [root.stat().st_dev for root in roots]
+    if len(set(devices)) != len(devices):
+        fail("each backing directory must be on a different filesystem")
+    weights = []
+    for i, root in enumerate(roots):
+        if i < len(existing) and args.keep_weights:
+            weight = existing[i][1]
+        elif args.weight:
+            weight = args.weight[i]
+        else:
+            print(f"Measuring read speed of {root}...", flush=True)
+            weight = measure_read_speed(root)
+        weights.append(weight)
+        print(f"{root}: weight {weight}")
+    if any(w <= 0 or w > 1000000 for w in weights):
+        fail("weights must be between 1 and 1000000")
+    if previous_mount and SERVICE.exists():
+        subprocess.run(["systemctl", "--user", "stop", "stripefs.service"], check=True)
+    if previous_mount and os.path.ismount(previous_mount):
+        subprocess.run(["fusermount3", "-u", str(previous_mount)], check=True)
+    if os.path.ismount(mount):
+        fail(f"mountpoint is already in use: {mount}")
+    STATE.mkdir(parents=True, exist_ok=True)
+    config_text = f"mount\t{mount}\n" + "".join(
+        f"root\t{weight}\t{root}\n" for root, weight in zip(roots, weights))
+    atomic_text(CONFIG, config_text)
+    SERVICE.parent.mkdir(parents=True, exist_ok=True)
+    service = ("[Unit]\nDescription=StripeFS FUSE filesystem\nAfter=local-fs.target\n\n"
+               "[Service]\nType=simple\n"
+               f"ExecStartPre={unit_quote(APP / 'stripefs')} recover\n"
+               f"ExecStart={unit_quote(APP / 'stripefsd')} {unit_quote(CONFIG)} -f\n"
+               f"ExecStop=/usr/bin/fusermount3 -u {unit_quote(mount)}\n"
+               "Restart=on-failure\nRestartSec=2\n\n"
+               "[Install]\nWantedBy=default.target\n")
+    atomic_text(SERVICE, service)
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+    subprocess.run(["systemctl", "--user", "enable", "stripefs.service"], check=True)
+    subprocess.run(["systemctl", "--user", "restart", "stripefs.service"], check=True)
+    print(f"StripeFS mounted at {mount}; managed by the user systemd service")
+
+
+def require_mount(mount):
+    if not os.path.ismount(mount):
+        fail(f"StripeFS is not mounted at {mount}; check systemctl --user status stripefs.service")
+
+
+def managed_target(source, mount):
+    resolved = source.resolve()
+    if resolved == mount or mount in resolved.parents:
+        return resolved
+    return mount / "originals" / source.absolute().relative_to("/")
+
+
+def choose_root(disks, size):
+    eligible = []
+    for root, weight in disks:
+        free = shutil.disk_usage(root).free
+        if free > size + RESERVE:
+            eligible.append((root, weight, free))
+    if not eligible:
+        fail(f"no configured disk has {size} bytes free for this file")
+    return max(eligible, key=lambda item: (item[1], item[2]))[0]
+
+
+def copy_file(source, logical, mount, disks):
+    relative = logical.relative_to(mount)
+    if logical.exists() or logical.is_symlink():
+        if logical.is_file() and digest(source) == digest(logical):
+            return
+        fail(f"managed path already exists with different content: {logical}")
+    logical.parent.mkdir(parents=True, exist_ok=True)
+    root = choose_root(disks, source.stat().st_size)
+    dest = root / relative
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    before = source.stat()
+    fd, temp = tempfile.mkstemp(prefix="import-", dir=root / ".stripefs" / "tmp")
+    try:
+        with os.fdopen(fd, "wb", buffering=1024 * 1024) as out, source.open("rb", buffering=1024 * 1024) as inp:
+            shutil.copyfileobj(inp, out, 1024 * 1024)
+            out.flush()
+            os.fsync(out.fileno())
+        after = source.stat()
+        if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+                after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+            fail(f"source changed during import: {source}")
+        if digest(source) != digest(Path(temp)):
+            fail(f"verification failed: {source}")
+        shutil.copystat(source, temp, follow_symlinks=False)
+        os.replace(temp, dest)
+        fsync_dir(dest.parent)
+    finally:
+        Path(temp).unlink(missing_ok=True)
+
+
+def copy_tree(source, logical, mount, disks):
+    if source.is_symlink():
+        fail("source symlinks must be resolved before import")
+    if source.is_file():
+        copy_file(source, logical, mount, disks)
+        return
+    if not source.is_dir():
+        fail(f"unsupported source type: {source}")
+    directories = []
+    for current, dirnames, filenames in os.walk(source, followlinks=False):
+        current = Path(current)
+        destination = logical / current.relative_to(source)
+        destination.mkdir(parents=True, exist_ok=True)
+        directories.append((current, destination))
+        for name in list(dirnames):
+            item = current / name
+            if item.is_symlink():
+                dirnames.remove(name)
+                filenames.append(name)
+        for name in filenames:
+            item = current / name
+            output = destination / name
+            if item.is_symlink():
+                if output.exists() or output.is_symlink():
+                    if not output.is_symlink() or os.readlink(output) != os.readlink(item):
+                        fail(f"conflicting link: {output}")
+                else:
+                    output.symlink_to(os.readlink(item))
+            elif item.is_file():
+                copy_file(item, output, mount, disks)
+            else:
+                fail(f"unsupported file type: {item}")
+    for old, new in reversed(directories):
+        shutil.copystat(old, new, follow_symlinks=False)
+
+
+def link_original(source, target):
+    links = load_links()
+    if str(source) in links:
+        return
+    token = uuid.uuid4().hex
+    backup = source.with_name(f".{source.name}.stripefs-original-{token}")
+    temporary = source.with_name(f".{source.name}.stripefs-link-{token}")
+    temporary.symlink_to(target)
+    record = {"source": str(source), "backup": str(backup),
+              "target": str(target), "temporary": str(temporary)}
+    journal = TRANSACTIONS / f"{token}.json"
+    atomic_text(journal, json.dumps(record) + "\n")
+    try:
+        os.replace(source, backup)
+        fsync_dir(source.parent)
+        os.replace(temporary, source)
+        fsync_dir(source.parent)
+        links[str(source)] = {"target": str(target), "backup": str(backup)}
+        save_links(links)
+        journal.unlink()
+        fsync_dir(journal.parent)
+    except Exception:
+        recover_links()
+        raise
+    print(f"{source} now points to {target}; original retained at {backup}")
+
+
+def cmd_add(args):
+    mount, disks = load_config()
+    require_mount(mount)
+    for raw in args.path:
+        source = Path(raw).expanduser().absolute()
+        if not source.exists():
+            fail(f"source does not exist: {source}")
+        if source.is_symlink() and str(source) in load_links():
+            print(f"already managed: {source}")
+            continue
+        if any(source == root or root in source.parents for root, _ in disks):
+            fail(f"cannot import a backing directory: {source}")
+        target = managed_target(source, mount)
+        if target == source:
+            print(f"already inside StripeFS: {source}")
+            continue
+        copy_tree(source, target, mount, disks)
+        if not args.no_link:
+            link_original(source, target)
+        print(f"added {source} -> {target}")
+
+
+def selected_files(path):
+    if path.is_file():
+        yield path
+    elif path.is_dir():
+        for root, dirs, files in os.walk(path):
+            dirs[:] = [d for d in dirs if not (Path(root) / d).is_symlink()]
+            for name in files:
+                item = Path(root) / name
+                if item.is_file() and not item.is_symlink():
+                    yield item
+    else:
+        fail(f"not a regular file or directory: {path}")
+
+
+def same_tree(a, b):
+    if a.is_symlink() or b.is_symlink():
+        return a.is_symlink() and b.is_symlink() and os.readlink(a) == os.readlink(b)
+    if a.is_file() or b.is_file():
+        return a.is_file() and b.is_file() and digest(a) == digest(b)
+    if a.is_dir() and b.is_dir():
+        left = {entry.name for entry in a.iterdir()}
+        right = {entry.name for entry in b.iterdir()}
+        return left == right and all(same_tree(a / name, b / name) for name in left)
+    return False
+
+
+def cmd_optimize(args):
+    mount, disks = load_config()
+    require_mount(mount)
+    for raw in args.path:
+        source = Path(raw).expanduser().absolute()
+        target = managed_target(source, mount)
+        if target != source and not target.exists():
+            cmd_add(argparse.Namespace(path=[str(source)], no_link=False))
+        for file in selected_files(target):
+            if os.getxattr(file, "user.stripefs.state") == b"striped":
+                pass
+            else:
+                os.setxattr(file, "user.stripefs.optimize", b"1")
+                print(f"striped {file}", flush=True)
+            identifier = os.getxattr(file, "user.stripefs.id").decode()
+            if args.discard_original:
+                for root, _ in disks:
+                    backup = root / ".stripefs" / "backups" / identifier
+                    if backup.exists():
+                        if digest(file) != digest(backup):
+                            fail(f"retained original differs; refusing to delete {backup}")
+                        backup.unlink()
+                        fsync_dir(backup.parent)
+                        print(f"deleted verified managed backup {backup}")
+            else:
+                print(f"original copy retained in .stripefs/backups/{identifier}")
+        if args.discard_original:
+            links = load_links()
+            record = links.get(str(source))
+            if record and record.get("backup"):
+                backup = Path(record["backup"])
+                if not same_tree(backup, target):
+                    fail(f"external original differs; refusing to delete {backup}")
+                if backup.is_dir():
+                    shutil.rmtree(backup)
+                else:
+                    backup.unlink()
+                fsync_dir(backup.parent)
+                record["backup"] = None
+                save_links(links)
+                print(f"deleted verified external original {backup}")
+
+
+def cmd_remove(args):
+    mount, _ = load_config()
+    require_mount(mount)
+    for raw in args.path:
+        source = Path(raw).expanduser().absolute()
+        target = managed_target(source, mount)
+        for file in selected_files(target):
+            if os.getxattr(file, "user.stripefs.state") == b"striped":
+                os.setxattr(file, "user.stripefs.unstripe", b"1")
+                print(f"restored plain file {file}", flush=True)
+
+
+def cmd_status(args):
+    mount, disks = load_config()
+    print(f"Mount: {mount} ({'active' if os.path.ismount(mount) else 'inactive'})")
+    for i, (root, weight) in enumerate(disks):
+        try:
+            usage = shutil.disk_usage(root)
+            chunks = root / ".stripefs" / "chunks"
+            chunk_bytes = sum(p.stat().st_size for p in chunks.glob("*/*") if p.is_file()) if chunks.exists() else 0
+            print(f"Disk {i}: {root}; weight={weight}; free={usage.free:,} bytes; stripes={chunk_bytes:,} bytes; healthy")
+        except OSError as error:
+            print(f"Disk {i}: {root}; UNAVAILABLE: {error}")
+    links = load_links()
+    print(f"Original paths linked: {len(links)}")
+    for raw in args.path:
+        path = Path(raw).expanduser().absolute()
+        managed = managed_target(path, mount)
+        state = os.getxattr(managed, "user.stripefs.state").decode()
+        print(f"{path}: {state}; managed at {managed}")
+        if state == "striped":
+            identifier = os.getxattr(managed, "user.stripefs.id").decode()
+            placement = (disks[0][0] / ".stripefs" / "maps" / identifier).read_bytes()
+            for i in range(len(disks)):
+                print(f"  disk {i}: {placement[8::16].count(i + 1)} chunks")
+
+
+def cmd_recover(args):
+    _ = args
+    recover_links()
+    print("StripeFS link transactions recovered")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    init = commands.add_parser("init", help="configure disks and start the systemd mount")
+    init.add_argument("--disk", action="append", required=True, help="backing directory; repeat per disk")
+    init.add_argument("--mount", default=str(Path.home() / "stripefs-mount"))
+    init.add_argument("--weight", type=int, action="append", help="speed weight; repeat per disk")
+    init.add_argument("--keep-weights", action="store_true")
+    init.set_defaults(func=cmd_init)
+    add = commands.add_parser("add", help="import files or directories, preserving originals as backups")
+    add.add_argument("path", nargs="+", type=Path)
+    add.add_argument("--no-link", action="store_true", help="leave original path unchanged")
+    add.set_defaults(func=cmd_add)
+    optimize = commands.add_parser("optimize", help="stripe selected files recursively")
+    optimize.add_argument("path", nargs="+", type=Path)
+    optimize.add_argument("--discard-original", action="store_true",
+                          help="explicitly delete verified original copies after striping")
+    optimize.set_defaults(func=cmd_optimize)
+    remove = commands.add_parser("remove", help="turn striped files back into plain managed files")
+    remove.add_argument("path", nargs="+", type=Path)
+    remove.set_defaults(func=cmd_remove)
+    status = commands.add_parser("status", help="show disk health, capacity, and file placement")
+    status.add_argument("path", nargs="*", type=Path)
+    status.set_defaults(func=cmd_status)
+    recover = commands.add_parser("recover", help="finish or roll back interrupted original-path links")
+    recover.set_defaults(func=cmd_recover)
+    args = parser.parse_args()
+    if args.command == "init" and args.weight and len(args.weight) != len(args.disk):
+        parser.error("provide one --weight per --disk")
+    try:
+        recover_links()
+        args.func(args)
+    except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
+        print(f"stripefs: {error}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
