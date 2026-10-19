@@ -9,10 +9,12 @@ int main(void) {
     struct fuse_config cfg = {0};
     ds_init(&conn, &cfg);
     assert(!direct_reads);
+#ifdef FUSE_CAP_DIRECT_IO_ALLOW_MMAP
     conn.capable = FUSE_CAP_DIRECT_IO_ALLOW_MMAP;
     ds_init(&conn, &cfg);
     assert(direct_reads);
     assert(conn.want & FUSE_CAP_DIRECT_IO_ALLOW_MMAP);
+#endif
     puts("PASS: direct reads require mmap capability; older kernels retain cache");
     return 0;
 }
