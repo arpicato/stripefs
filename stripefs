@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """StripeFS storage manager. Run `stripefs COMMAND --help` for details."""
 import argparse
+from contextlib import contextmanager
+import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -18,8 +21,13 @@ APP = Path(__file__).resolve().parent
 STATE = Path.home() / ".config" / "stripefs"
 CONFIG = STATE / "config"
 LINKS = STATE / "links.json"
+WATCHES = STATE / "watches.json"
+WATCH_LOCK = STATE / "watches.lock"
 TRANSACTIONS = STATE / "transactions"
 SERVICE = Path.home() / ".config" / "systemd" / "user" / "stripefs.service"
+WATCH_SERVICE = SERVICE.with_name("stripefs-watch.service")
+WATCH_SETTLE = 60
+WATCH_INTERVAL = 15
 RESERVE = 64 * 1024 * 1024
 
 
@@ -74,6 +82,43 @@ def load_links():
 
 def save_links(links):
     atomic_text(LINKS, json.dumps(links, indent=2, sort_keys=True) + "\n")
+
+
+def load_watches():
+    return json.loads(WATCHES.read_text()) if WATCHES.exists() else {}
+
+
+def save_watches(watches):
+    atomic_text(WATCHES, json.dumps(watches, indent=2, sort_keys=True) + "\n")
+
+
+@contextmanager
+def locked_watches():
+    STATE.mkdir(parents=True, exist_ok=True)
+    with WATCH_LOCK.open("a+b") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def watch_key(target, mount):
+    return str(target.relative_to(mount))
+
+
+def install_watch_service():
+    WATCH_SERVICE.parent.mkdir(parents=True, exist_ok=True)
+    service = ("[Unit]\nDescription=StripeFS directory auto-optimization\n"
+               "Requires=stripefs.service\nAfter=stripefs.service\n"
+               "PartOf=stripefs.service\n\n[Service]\nType=simple\n"
+               f"ExecStart={unit_quote(APP / 'stripefs')} watch-worker\n"
+               "Restart=on-failure\nRestartSec=2\n\n"
+               "[Install]\nWantedBy=default.target\n")
+    atomic_text(WATCH_SERVICE, service)
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+    subprocess.run(["systemctl", "--user", "enable", "stripefs-watch.service"], check=True)
+    subprocess.run(["systemctl", "--user", "restart", "stripefs-watch.service"], check=True)
 
 
 def recover_links():
@@ -193,6 +238,7 @@ def cmd_init(args):
     subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
     subprocess.run(["systemctl", "--user", "enable", "stripefs.service"], check=True)
     subprocess.run(["systemctl", "--user", "restart", "stripefs.service"], check=True)
+    install_watch_service()
     print(f"StripeFS mounted at {mount}; managed by the user systemd service")
 
 
@@ -368,11 +414,28 @@ def cmd_optimize(args):
         target = managed_target(source, mount)
         if target != source and not target.exists():
             cmd_add(argparse.Namespace(path=[str(source)], no_link=False))
+        if args.watch:
+            if not target.is_dir():
+                fail(f"--watch requires a directory: {source}")
+            if target != source and source.resolve() != target:
+                fail(f"{source} is not linked to its managed copy; watch the managed path {target}")
+            with locked_watches():
+                watches = load_watches()
+                watches[watch_key(target, mount)] = {"source": str(source)}
+                save_watches(watches)
+            install_watch_service()
+            print(f"watching {source} recursively; new files stripe after {WATCH_SETTLE}s stable")
         for file in selected_files(target):
             if os.getxattr(file, "user.stripefs.state") == b"striped":
                 pass
             else:
-                os.setxattr(file, "user.stripefs.optimize", b"1")
+                try:
+                    os.setxattr(file, "user.stripefs.optimize", b"1")
+                except OSError as error:
+                    if args.watch and error.errno == errno.EBUSY:
+                        print(f"deferred busy file {file}")
+                        continue
+                    raise
                 print(f"striped {file}", flush=True)
             identifier = os.getxattr(file, "user.stripefs.id").decode()
             if args.discard_original:
@@ -403,12 +466,85 @@ def cmd_optimize(args):
                 print(f"deleted verified external original {backup}")
 
 
+def cmd_unwatch(args):
+    mount, _ = load_config()
+    with locked_watches():
+        watches = load_watches()
+        for raw in args.path:
+            source = Path(raw).expanduser().absolute()
+            target = managed_target(source, mount)
+            key = watch_key(target, mount)
+            if key not in watches:
+                fail(f"no directory watch for {source}")
+            del watches[key]
+            print(f"stopped watching {source}")
+        save_watches(watches)
+
+
+def is_watched(file, mount, watches):
+    return any(mount / key in file.parents for key in watches)
+
+
+def watch_scan(mount, seen, settle):
+    now = time.monotonic()
+    current = {}
+    for key in load_watches():
+        directory = mount / key
+        if not directory.is_dir():
+            print(f"stripefs-watch: unavailable directory {directory}", file=sys.stderr, flush=True)
+            continue
+        for file in selected_files(directory):
+            try:
+                st = file.stat()
+                signature = (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+                identifier = str(file)
+                previous = seen.get(identifier)
+                first_seen = previous[1] if previous and previous[0] == signature else now
+                current[identifier] = (signature, first_seen)
+                if now - first_seen < settle:
+                    continue
+                if os.getxattr(file, "user.stripefs.state") == b"plain":
+                    with locked_watches():
+                        if is_watched(file, mount, load_watches()):
+                            os.setxattr(file, "user.stripefs.optimize", b"1")
+                            print(f"stripefs-watch: striped {file}", flush=True)
+            except OSError as error:
+                if error.errno not in (errno.EBUSY, errno.ENOENT, errno.ESTALE):
+                    print(f"stripefs-watch: {file}: {error}", file=sys.stderr, flush=True)
+    return current
+
+
+def cmd_watch_worker(args):
+    mount, _ = load_config()
+    seen = {}
+    while True:
+        if os.path.ismount(mount):
+            seen = watch_scan(mount, seen, args.settle)
+        else:
+            seen = {}
+        if args.once:
+            break
+        time.sleep(args.interval)
+
+
 def cmd_remove(args):
     mount, _ = load_config()
     require_mount(mount)
     for raw in args.path:
         source = Path(raw).expanduser().absolute()
         target = managed_target(source, mount)
+        with locked_watches():
+            watches = load_watches()
+            active = [key for key in watches if target == mount / key or
+                      target in (mount / key).parents]
+            ancestors = [key for key in watches if mount / key in target.parents]
+            if ancestors:
+                fail(f"{source} is inside a watched directory; unwatch its parent first")
+            if active:
+                for key in active:
+                    del watches[key]
+                save_watches(watches)
+                print(f"stopped {len(active)} directory watch(es) under {source}")
         for file in selected_files(target):
             if os.getxattr(file, "user.stripefs.state") == b"striped":
                 os.setxattr(file, "user.stripefs.unstripe", b"1")
@@ -428,6 +564,18 @@ def cmd_status(args):
             print(f"Disk {i}: {root}; UNAVAILABLE: {error}")
     links = load_links()
     print(f"Original paths linked: {len(links)}")
+    watches = load_watches()
+    print(f"Watched directories: {len(watches)}")
+    if watches:
+        try:
+            worker = subprocess.run(["systemctl", "--user", "is-active", "stripefs-watch.service"],
+                                    text=True, capture_output=True)
+            worker_state = worker.stdout.strip() or "unavailable"
+        except OSError:
+            worker_state = "unavailable"
+        print(f"Watch worker: {worker_state}")
+    for key, record in watches.items():
+        print(f"  {record['source']} -> {mount / key}")
     for raw in args.path:
         path = Path(raw).expanduser().absolute()
         managed = managed_target(path, mount)
@@ -463,7 +611,17 @@ def main():
     optimize.add_argument("path", nargs="+", type=Path)
     optimize.add_argument("--discard-original", action="store_true",
                           help="explicitly delete verified original copies after striping")
+    optimize.add_argument("--watch", action="store_true",
+                          help="keep striping new stable files in these directories")
     optimize.set_defaults(func=cmd_optimize)
+    unwatch = commands.add_parser("unwatch", help="stop automatic striping for directories")
+    unwatch.add_argument("path", nargs="+", type=Path)
+    unwatch.set_defaults(func=cmd_unwatch)
+    worker = commands.add_parser("watch-worker", help=argparse.SUPPRESS)
+    worker.add_argument("--once", action="store_true", help=argparse.SUPPRESS)
+    worker.add_argument("--settle", type=float, default=WATCH_SETTLE, help=argparse.SUPPRESS)
+    worker.add_argument("--interval", type=float, default=WATCH_INTERVAL, help=argparse.SUPPRESS)
+    worker.set_defaults(func=cmd_watch_worker)
     remove = commands.add_parser("remove", help="turn striped files back into plain managed files")
     remove.add_argument("path", nargs="+", type=Path)
     remove.set_defaults(func=cmd_remove)
@@ -475,6 +633,8 @@ def main():
     args = parser.parse_args()
     if args.command == "init" and args.weight and len(args.weight) != len(args.disk):
         parser.error("provide one --weight per --disk")
+    if args.command == "optimize" and args.watch and args.discard_original:
+        parser.error("--watch retains verified backups; use --discard-original separately")
     try:
         recover_links()
         args.func(args)
