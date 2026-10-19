@@ -28,6 +28,11 @@ def read_file(path):
     return time.perf_counter() - started
 
 
+def read_sectors(devices):
+    return {device: int((Path("/sys/block") / device / "stat").read_text().split()[2])
+            for device in devices}
+
+
 def random_reads(path, offsets):
     fd = os.open(path, os.O_RDONLY)
     timings = []
@@ -49,9 +54,22 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--size-mib", type=int, default=3072)
     parser.add_argument("--repetitions", type=int, default=3)
+    parser.add_argument("--weights", default="1,1",
+                        help="positive disk0,disk1 placement weights (default: 1,1)")
+    parser.add_argument("--devices", default="",
+                        help="comma-separated block devices for physical read accounting")
     args = parser.parse_args()
     if args.size_mib % 4:
         parser.error("size must be a multiple of 4 MiB")
+    try:
+        weight0, weight1 = (int(value) for value in args.weights.split(","))
+        if not 1 <= weight0 <= 1000000 or not 1 <= weight1 <= 1000000:
+            raise ValueError
+    except ValueError:
+        parser.error("--weights must be two positive integers separated by a comma")
+    devices = [device for device in args.devices.split(",") if device]
+    if any(not (Path("/sys/block") / device / "stat").is_file() for device in devices):
+        parser.error("--devices must name devices present under /sys/block")
     with tempfile.TemporaryDirectory(prefix="stripefs-bench-", dir=Path.home()) as a, \
          tempfile.TemporaryDirectory(prefix="stripefs-bench-", dir="/mnt/data") as b:
         a, b = Path(a), Path(b)
@@ -59,7 +77,8 @@ def main():
         mount, config = a / "mount", a / "config"
         for path in (*roots, mount):
             path.mkdir()
-        config.write_text(f"mount\t{mount}\nroot\t2\t{roots[0]}\nroot\t1\t{roots[1]}\n")
+        config.write_text(f"mount\t{mount}\nroot\t{weight0}\t{roots[0]}\n"
+                          f"root\t{weight1}\t{roots[1]}\n")
         raw = [roots[0] / "file.bin", roots[1] / "reference.bin"]
         for path in raw:
             print(f"Writing {args.size_mib} MiB to {path.parent}...", flush=True)
@@ -81,6 +100,7 @@ def main():
             identifier = os.getxattr(mount / "file.bin", "user.stripefs.id").decode()
             original = roots[0] / ".stripefs" / "backups" / identifier
             chunks = [p for root in roots for p in (root / ".stripefs" / "chunks" / identifier).iterdir()]
+            print(f"Stripe bytes by disk: {[p.stat().st_size for p in chunks]}", flush=True)
             cases = {"striped": mount / "file.bin", "ext4_disk0": original, "ext4_disk1": raw[1]}
             results = {name: [] for name in cases}
             order = list(cases)
@@ -89,10 +109,15 @@ def main():
                 rng.shuffle(order)
                 for name in order:
                     evict([*chunks, original, raw[1], mount / "file.bin"])
+                    before = read_sectors(devices)
                     elapsed = read_file(cases[name])
+                    after = read_sectors(devices)
                     rate = args.size_mib / elapsed
                     results[name].append(rate)
-                    print(f"trial {trial + 1} {name}: {elapsed:.2f}s, {rate:.0f} MiB/s", flush=True)
+                    physical = {device: round((after[device] - before[device]) * 512 / (1024 * 1024), 1)
+                                for device in devices}
+                    print(f"trial {trial + 1} {name}: {elapsed:.2f}s, {rate:.0f} MiB/s"
+                          + (f"; physical read MiB {physical}" if devices else ""), flush=True)
             for name, rates in results.items():
                 print(f"median {name}: {statistics.median(rates):.0f} MiB/s "
                       f"(range {min(rates):.0f}-{max(rates):.0f})", flush=True)
