@@ -35,13 +35,17 @@ To make the command available from any directory, link the checked-out executabl
 ```sh
 stripefs add /path/to/game
 stripefs optimize /path/to/game
+stripefs optimize --watch /path/to/game
 stripefs status /path/to/game
+stripefs unwatch /path/to/game
 stripefs remove /path/to/game
 ```
 
 `add` imports recursively as ordinary files, verifies every copy with SHA-256, moves the original to an adjacent hidden backup, then links the original path to the managed copy. Applications can keep using that path. `--no-link` imports without changing the original path. Keep the source quiet during import. Unsupported special files and conflicting destination names cause an error. `optimize` imports automatically when needed, then stripes regular files recursively. It verifies each stripe against the source before switching the visible file. By default it retains both the pre-stripe managed copy and the original path backup. `--discard-original` deletes those copies only after verification; this is the explicit space-reclaiming operation. A 100 GB striped file then uses roughly 100 GB across the backing disks, not 200 GB.
 
 `remove` reverses striping by reconstructing and verifying ordinary managed files. It does not remove them from management or delete either original path backup. Existing original-path symlinks continue to work and the files become writable. Run `stripefs recover` after an interrupted import or original-path switch; the service also runs it before mounting. `status PATH` shows per-disk chunk placement and usage. For service details, use `systemctl --user status stripefs.service`.
+
+`optimize --watch DIR` also saves a persistent, recursive directory policy. StripeFS immediately processes existing files and its `stripefs-watch.service` checks for new files every 15 seconds. A new file must remain unchanged for 60 seconds before conversion; open files are retried later. The policy survives service restarts and applies to files created or renamed into nested directories through the managed path. It does not follow symlinked subdirectories. Use it for files that become immutable after being written, such as installed game assets or finished model downloads. Once a file is striped, writes return `EROFS`; run `stripefs remove FILE` after `stripefs unwatch DIR` to make it writable. `unwatch` stops future conversions without changing files already striped. `remove DIR` also stops watches inside that directory before reconstructing its files. The watcher retains verified pre-stripe copies, so check free space and use a separate `optimize --discard-original` operation when you explicitly want to reclaim it. The watcher service is installed by `init` and by `optimize --watch` on existing installations.
 
 ## Safety and limits
 
