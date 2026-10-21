@@ -164,9 +164,11 @@ static void prefetch_stripes(struct sf_handle *h, size_t size, off_t off) {
     if (off < 0) return;
     uint64_t index = (uint64_t)off / CHUNK_SIZE;
     pthread_mutex_lock(&h->prefetch_lock);
-    bool sequential = off == 0 || ((uint64_t)off >= h->last_end &&
-                      (uint64_t)off - h->last_end <= CHUNK_SIZE);
-    if ((uint64_t)off + size > h->last_end) h->last_end = (uint64_t)off + size;
+    bool sequential = (uint64_t)off >= h->last_end &&
+                      (uint64_t)off - h->last_end <= CHUNK_SIZE;
+    /* A seek starts a new stream; never prefetch the gap between tensors. */
+    if (!sequential) h->prefetched_any = false;
+    h->last_end = (uint64_t)off + size;
     if (sequential && (!h->prefetched_any || index + 3 >= h->prefetched_through)) {
         struct stat st;
         if (!fstat(h->map_fd, &st)) {
